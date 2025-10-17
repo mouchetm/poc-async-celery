@@ -31,6 +31,14 @@ class Conversation(SQLModel, table=True):
 
 
 class StreamChunk(SQLModel, table=True):
+    """
+    LEGACY: This table is not used in the current Redis-based streaming implementation.
+    
+    Streaming chunks are now stored in Redis (ephemeral, with 1-hour TTL) for real-time delivery.
+    Only final messages are persisted to the Message table in PostgreSQL.
+    
+    This model is kept for backwards compatibility and potential future use cases.
+    """
     __tablename__ = "stream_chunks"
 
     id: Optional[int] = Field(default=None, primary_key=True)

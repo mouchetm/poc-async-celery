@@ -1,18 +1,25 @@
 from celery_config import celery_app
 from openai import AsyncOpenAI
-from sqlmodel import Session, select
-from models import Message as MessageModel, StreamChunk
+from sqlmodel import Session
+from models import Message as MessageModel
 from database import engine
 import os
 import asyncio
 import logging
+import json
 from datetime import datetime
+from typing import Dict, Any
+import redis.asyncio as redis
 
 # Configure logging
 logger = logging.getLogger("celery_tasks")
 
 # Initialize OpenAI client
 openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Redis configuration
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+CHUNK_TTL = 3600  # 1 hour TTL for chunks
 
 
 @celery_app.task(bind=True)
@@ -31,6 +38,37 @@ def process_openai_stream(self, message_id: int, user_content: str, conversation
     return {"status": "completed", "message_id": message_id}
 
 
+async def store_chunk(task_id: str, chunk_data: Dict[str, Any]) -> None:
+    """Store a chunk in Redis and publish to pub/sub channel."""
+    r = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        list_key = f"stream:{task_id}:chunks"
+        chunk_json = json.dumps(chunk_data)
+        
+        # Push chunk to list
+        await r.rpush(list_key, chunk_json)
+        
+        # Set TTL on the list (resets with each chunk)
+        await r.expire(list_key, CHUNK_TTL)
+        
+        # Publish notification that a new chunk is available
+        channel = f"stream:{task_id}"
+        await r.publish(channel, chunk_json)
+    finally:
+        await r.aclose()
+
+
+async def store_stream_metadata(task_id: str, metadata: Dict[str, Any]) -> None:
+    """Store metadata about a stream."""
+    r = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        metadata_key = f"stream:{task_id}:metadata"
+        await r.hset(metadata_key, mapping={k: json.dumps(v) for k, v in metadata.items()})
+        await r.expire(metadata_key, CHUNK_TTL)
+    finally:
+        await r.aclose()
+
+
 async def process_stream_async(task_id: str, message_id: int, user_content: str, conversation_id: int):
     """Async function that handles the OpenAI stream"""
     stream_start = datetime.now()
@@ -38,6 +76,14 @@ async def process_stream_async(task_id: str, message_id: int, user_content: str,
     assistant_reasoning = ""
     chunk_count = 0
     chunk_index = 0
+    
+    # Store metadata in Redis
+    await store_stream_metadata(task_id, {
+        "message_id": message_id,
+        "conversation_id": conversation_id,
+        "status": "processing",
+        "started_at": stream_start.isoformat()
+    })
     
     try:
         logger.info(f"[Task {task_id}] Starting OpenAI stream request...")
@@ -70,18 +116,13 @@ async def process_stream_async(task_id: str, message_id: int, user_content: str,
                     chunk_count += 1
                     assistant_content += delta
                     
-                    # Store chunk in database
-                    with Session(engine) as session:
-                        chunk = StreamChunk(
-                            task_id=task_id,
-                            message_id=message_id,
-                            chunk_index=chunk_index,
-                            chunk_type="content",
-                            content=delta
-                        )
-                        session.add(chunk)
-                        session.commit()
-                        chunk_index += 1
+                    # Store chunk in Redis
+                    await store_chunk(task_id, {
+                        "chunk_index": chunk_index,
+                        "chunk_type": "content",
+                        "content": delta
+                    })
+                    chunk_index += 1
                     
                     if chunk_count % 10 == 0:
                         elapsed = (datetime.now() - stream_start).total_seconds()
@@ -94,22 +135,17 @@ async def process_stream_async(task_id: str, message_id: int, user_content: str,
                 if reasoning_delta:
                     assistant_reasoning += reasoning_delta
                     
-                    # Store reasoning chunk
-                    with Session(engine) as session:
-                        chunk = StreamChunk(
-                            task_id=task_id,
-                            message_id=message_id,
-                            chunk_index=chunk_index,
-                            chunk_type="reasoning",
-                            content=reasoning_delta
-                        )
-                        session.add(chunk)
-                        session.commit()
-                        chunk_index += 1
+                    # Store reasoning chunk in Redis
+                    await store_chunk(task_id, {
+                        "chunk_index": chunk_index,
+                        "chunk_type": "reasoning",
+                        "content": reasoning_delta
+                    })
+                    chunk_index += 1
                     
                     logger.info(f"[Task {task_id}] Reasoning chunk received")
         
-        # Update the message with final content
+        # Update the message with final content in database
         with Session(engine) as session:
             message = session.get(MessageModel, message_id)
             if message:
@@ -119,17 +155,21 @@ async def process_stream_async(task_id: str, message_id: int, user_content: str,
                 session.add(message)
                 session.commit()
                 logger.info(f"[Task {task_id}] Message updated with final content")
-            
-            # Store done marker
-            done_chunk = StreamChunk(
-                task_id=task_id,
-                message_id=message_id,
-                chunk_index=chunk_index,
-                chunk_type="done",
-                content=""
-            )
-            session.add(done_chunk)
-            session.commit()
+        
+        # Store done marker in Redis
+        await store_chunk(task_id, {
+            "chunk_index": chunk_index,
+            "chunk_type": "done",
+            "content": ""
+        })
+        
+        # Update metadata
+        await store_stream_metadata(task_id, {
+            "status": "completed",
+            "completed_at": datetime.now().isoformat(),
+            "chunk_count": chunk_count,
+            "content_length": len(assistant_content)
+        })
         
         stream_end = datetime.now()
         total_time = (stream_end - stream_start).total_seconds()
@@ -140,17 +180,19 @@ async def process_stream_async(task_id: str, message_id: int, user_content: str,
     except Exception as e:
         logger.error(f"[Task {task_id}] ERROR: {str(e)}")
         
-        # Store error chunk
-        with Session(engine) as session:
-            error_chunk = StreamChunk(
-                task_id=task_id,
-                message_id=message_id,
-                chunk_index=chunk_index,
-                chunk_type="error",
-                content=str(e)
-            )
-            session.add(error_chunk)
-            session.commit()
+        # Store error chunk in Redis
+        await store_chunk(task_id, {
+            "chunk_index": chunk_index,
+            "chunk_type": "error",
+            "content": str(e)
+        })
+        
+        # Update metadata
+        await store_stream_metadata(task_id, {
+            "status": "error",
+            "error": str(e),
+            "failed_at": datetime.now().isoformat()
+        })
         
         raise
 

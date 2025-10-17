@@ -1,17 +1,18 @@
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from sqlmodel import SQLModel, Session, select
+from sqlmodel import SQLModel, Session
 from openai import AsyncOpenAI
 import os
-from typing import AsyncGenerator
+from typing import AsyncGenerator, List, Dict, Any
 import json
 import logging
 import asyncio
 from datetime import datetime
+import redis.asyncio as redis
 
 from database import engine, get_session
-from models import Conversation as ConversationModel, Message as MessageModel, StreamChunk
+from models import Conversation as ConversationModel, Message as MessageModel
 from schemas import ConversationPublic, ConversationCreate, MessageCreate
 from dotenv import load_dotenv
 from tasks import process_openai_stream
@@ -25,6 +26,9 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger("chat_api")
+
+# Redis configuration
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 app = FastAPI(title="Chat API")
 
@@ -138,6 +142,11 @@ async def send_message(
         args=[assistant_message.id, message.content, conversation_id]
     )
     
+    # Save task_id to the message immediately for reconnection support
+    assistant_message.task_id = task.id
+    session.add(assistant_message)
+    session.commit()
+    
     logger.info(f"[Conv {conversation_id}] Celery task triggered: {task.id}")
     logger.info(f"[Conv {conversation_id}] Client should stream from: /stream/{task.id}")
     
@@ -149,62 +158,113 @@ async def send_message(
 
 
 @app.get("/stream/{task_id}")
-async def stream_response(
-    task_id: str,
-    session: Session = Depends(get_session)
-):
+async def stream_response(task_id: str):
     """
-    Stream the AI response from the database as chunks become available.
-    This endpoint polls the database and streams chunks to the client.
+    Stream the AI response from Redis using pub/sub for real-time delivery.
+    This eliminates database polling and provides sub-millisecond latency.
+    
+    Uses redis.asyncio for proper async/await support.
     """
     logger.info(f"[Stream {task_id}] Client connected for streaming")
     
     async def generate_stream() -> AsyncGenerator[str, None]:
-        """Stream chunks from database as they become available"""
-        last_chunk_index = -1
+        """Stream chunks from Redis using async pub/sub (no blocking!)"""
         done = False
         max_wait_time = 300  # 5 minutes timeout
         start_time = datetime.now()
         
-        while not done:
-            # Check timeout
-            elapsed = (datetime.now() - start_time).total_seconds()
-            if elapsed > max_wait_time:
-                logger.warning(f"[Stream {task_id}] Timeout reached after {elapsed:.1f}s")
-                yield f"data: {json.dumps({'error': 'Stream timeout'})}\n\n"
-                break
-            
-            # Fetch new chunks
-            statement = select(StreamChunk).where(
-                StreamChunk.task_id == task_id,
-                StreamChunk.chunk_index > last_chunk_index
-            ).order_by(StreamChunk.chunk_index)
-            
-            chunks = session.exec(statement).all()
-            
-            if chunks:
-                for chunk in chunks:
-                    last_chunk_index = chunk.chunk_index
-                    
-                    if chunk.chunk_type == "content":
-                        yield f"data: {json.dumps({'content': chunk.content})}\n\n"
-                    elif chunk.chunk_type == "reasoning":
-                        yield f"data: {json.dumps({'reasoning': chunk.content})}\n\n"
-                    elif chunk.chunk_type == "done":
-                        logger.info(f"[Stream {task_id}] Stream completed")
-                        yield f"data: {json.dumps({'done': True})}\n\n"
-                        done = True
-                        break
-                    elif chunk.chunk_type == "error":
-                        logger.error(f"[Stream {task_id}] Error: {chunk.content}")
-                        yield f"data: {json.dumps({'error': chunk.content})}\n\n"
-                        done = True
-                        break
-            else:
-                # No new chunks, wait a bit before polling again
-                await asyncio.sleep(0.1)  # 100ms polling interval
+        # First, send any chunks that already exist (in case we're late to the party)
+        # Get existing chunks from Redis
+        r = redis.from_url(REDIS_URL, decode_responses=True)
+        try:
+            list_key = f"stream:{task_id}:chunks"
+            chunk_strings = await r.lrange(list_key, 0, -1)
+            existing_chunks = [json.loads(chunk_str) for chunk_str in chunk_strings]
+        finally:
+            await r.aclose()
         
-        logger.info(f"[Stream {task_id}] Stream ended")
+        for chunk_data in existing_chunks:
+            chunk_type = chunk_data.get("chunk_type")
+            content = chunk_data.get("content", "")
+            
+            if chunk_type == "content":
+                yield f"data: {json.dumps({'content': content})}\n\n"
+            elif chunk_type == "reasoning":
+                yield f"data: {json.dumps({'reasoning': content})}\n\n"
+            elif chunk_type == "done":
+                logger.info(f"[Stream {task_id}] Stream already completed")
+                yield f"data: {json.dumps({'done': True})}\n\n"
+                done = True
+                return
+            elif chunk_type == "error":
+                logger.error(f"[Stream {task_id}] Error: {content}")
+                yield f"data: {json.dumps({'error': content})}\n\n"
+                done = True
+                return
+        
+        # If already done, don't subscribe
+        if done:
+            return
+        
+        # Subscribe to Redis pub/sub for real-time chunks using async context manager
+        r = redis.from_url(REDIS_URL, decode_responses=True)
+        
+        try:
+            async with r.pubsub() as pubsub:
+                channel = f"stream:{task_id}"
+                await pubsub.subscribe(channel)
+                
+                logger.info(f"[Stream {task_id}] Subscribed to Redis pub/sub channel")
+                
+                # Process messages from pub/sub using async get_message
+                # This is non-blocking and allows multiple concurrent streams
+                while not done:
+                    # Check timeout
+                    elapsed = (datetime.now() - start_time).total_seconds()
+                    if elapsed > max_wait_time:
+                        logger.warning(f"[Stream {task_id}] Timeout reached after {elapsed:.1f}s")
+                        yield f"data: {json.dumps({'error': 'Stream timeout'})}\n\n"
+                        break
+                    
+                    # Get message with timeout (async, non-blocking)
+                    # timeout=1.0 means wait up to 1 second for a message
+                    message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                    
+                    if message is None:
+                        # No message yet, continue waiting
+                        # The timeout in get_message handles the waiting, so we don't block
+                        continue
+                    
+                    # Process the message
+                    if message['type'] == 'message':
+                        try:
+                            chunk_data = json.loads(message['data'])
+                            chunk_type = chunk_data.get("chunk_type")
+                            content = chunk_data.get("content", "")
+                            
+                            if chunk_type == "content":
+                                yield f"data: {json.dumps({'content': content})}\n\n"
+                            elif chunk_type == "reasoning":
+                                yield f"data: {json.dumps({'reasoning': content})}\n\n"
+                            elif chunk_type == "done":
+                                logger.info(f"[Stream {task_id}] Stream completed")
+                                yield f"data: {json.dumps({'done': True})}\n\n"
+                                done = True
+                                break
+                            elif chunk_type == "error":
+                                logger.error(f"[Stream {task_id}] Error: {content}")
+                                yield f"data: {json.dumps({'error': content})}\n\n"
+                                done = True
+                                break
+                        except json.JSONDecodeError:
+                            logger.error(f"[Stream {task_id}] Failed to decode message")
+                            continue
+                
+                logger.info(f"[Stream {task_id}] Stream ended")
+        
+        finally:
+            # Cleanup Redis client
+            await r.aclose()
     
     return StreamingResponse(
         generate_stream(),

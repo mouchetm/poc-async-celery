@@ -14,6 +14,7 @@ class MessagePublic(SQLModel):
     role: str
     content: str
     reasoning: Optional[str] = None
+    task_id: Optional[str] = None
     created_at: datetime
 
 
