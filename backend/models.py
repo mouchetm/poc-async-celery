@@ -10,6 +10,7 @@ class Message(SQLModel, table=True):
     conversation_id: int = Field(foreign_key="conversations.id")
     role: str  # 'user' or 'assistant'
     content: str
+    reasoning: Optional[str] = None  # AI reasoning (if available)
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
     # Relationship

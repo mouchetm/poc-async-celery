@@ -13,6 +13,7 @@ class MessagePublic(SQLModel):
     conversation_id: int
     role: str
     content: str
+    reasoning: Optional[str] = None
     created_at: datetime
 
 

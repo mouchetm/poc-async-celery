@@ -121,6 +121,7 @@ async def send_message(
         """Generate streaming response from OpenAI using Responses API"""
         stream_start = datetime.now()
         assistant_content = ""
+        assistant_reasoning = ""
         chunk_count = 0
 
         try:
@@ -131,7 +132,7 @@ async def send_message(
             stream = await openai_client.responses.create(
                 model="gpt-5",
                 input=message.content,
-                reasoning={"effort": "high"},
+                reasoning={"effort": "high", "summary": "auto"},
                 stream=True
             )
             
@@ -164,11 +165,26 @@ async def send_message(
                         yield f"data: {json.dumps({'content': delta})}\n\n"
 
                 # Handle reasoning progress if available
-                elif event.type == "response.reasoning_text.delta":
+                elif event.type == "response.reasoning_summary_text.delta":
                     reasoning_delta = getattr(event, "delta", "")
                     if reasoning_delta:
+                        assistant_reasoning += reasoning_delta
                         logger.info(f"[Conv {conversation_id}] 🧠 Reasoning chunk received")
                         yield f"data: {json.dumps({'reasoning': reasoning_delta})}\n\n"
+
+                else:
+                    logger.warning(f"[Conv {conversation_id}] Unknown event type: {event.type}, full event: {event}")
+
+            # Save assistant message to database
+            assistant_message = MessageModel(
+                conversation_id=conversation_id,
+                role="assistant",
+                content=assistant_content,
+                reasoning=assistant_reasoning if assistant_reasoning else None
+            )
+            session.add(assistant_message)
+            session.commit()
+            logger.info(f"[Conv {conversation_id}] Assistant message saved to database")
 
             # Final done signal
             stream_end = datetime.now()
@@ -180,6 +196,7 @@ async def send_message(
             logger.info(f"[Conv {conversation_id}] Statistics:")
             logger.info(f"[Conv {conversation_id}]   - Total chunks: {chunk_count}")
             logger.info(f"[Conv {conversation_id}]   - Total characters: {len(assistant_content)}")
+            logger.info(f"[Conv {conversation_id}]   - Reasoning characters: {len(assistant_reasoning)}")
             logger.info(f"[Conv {conversation_id}]   - Stream time: {total_time:.3f}s")
             logger.info(f"[Conv {conversation_id}]   - Total request time: {request_time:.3f}s")
             logger.info(f"[Conv {conversation_id}]   - End time: {stream_end.strftime('%H:%M:%S.%f')[:-3]}")
