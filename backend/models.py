@@ -12,6 +12,7 @@ class Message(SQLModel, table=True):
     content: str
     reasoning: Optional[str] = None  # AI reasoning (if available)
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    task_id: Optional[str] = None  # Celery task ID for tracking
 
     # Relationship
     conversation: Optional["Conversation"] = Relationship(back_populates="messages")
@@ -27,3 +28,15 @@ class Conversation(SQLModel, table=True):
 
     # Relationship
     messages: List["Message"] = Relationship(back_populates="conversation", cascade_delete=True)
+
+
+class StreamChunk(SQLModel, table=True):
+    __tablename__ = "stream_chunks"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    task_id: str = Field(index=True)  # Celery task ID
+    message_id: Optional[int] = Field(default=None, foreign_key="messages.id")
+    chunk_index: int  # Order of chunks
+    chunk_type: str  # 'content', 'reasoning', 'done', or 'error'
+    content: str  # Chunk content
+    created_at: datetime = Field(default_factory=datetime.utcnow)

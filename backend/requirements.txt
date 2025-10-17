@@ -5,3 +5,6 @@ psycopg2-binary
 openai
 pydantic
 python-dotenv
+celery
+redis
+asyncpg

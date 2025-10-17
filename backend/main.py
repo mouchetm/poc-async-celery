@@ -11,9 +11,10 @@ import asyncio
 from datetime import datetime
 
 from database import engine, get_session
-from models import Conversation as ConversationModel, Message as MessageModel
+from models import Conversation as ConversationModel, Message as MessageModel, StreamChunk
 from schemas import ConversationPublic, ConversationCreate, MessageCreate
 from dotenv import load_dotenv
+from tasks import process_openai_stream
 
 load_dotenv()
 
@@ -90,12 +91,14 @@ async def send_message(
     message: MessageCreate,
     session: Session = Depends(get_session)
 ):
-    """Send a message to a conversation and stream the AI response"""
+    """
+    Send a message to a conversation and trigger AI processing via Celery.
+    Returns immediately with task_id and message_id for streaming.
+    """
     request_start = datetime.now()
-    task_id = id(asyncio.current_task())
     logger.info(f"")
     logger.info(f"{'='*80}")
-    logger.info(f"📨 NEW MESSAGE REQUEST | Conversation ID: {conversation_id} | Task: {task_id}")
+    logger.info(f"📨 NEW MESSAGE REQUEST | Conversation ID: {conversation_id}")
     logger.info(f"Message preview: {message.content[:100]}{'...' if len(message.content) > 100 else ''}")
     logger.info(f"{'='*80}")
     
@@ -115,107 +118,94 @@ async def send_message(
     )
     session.add(user_message)
     session.commit()
-    logger.info(f"[Conv {conversation_id}] User message saved to database")
+    session.refresh(user_message)
+    logger.info(f"[Conv {conversation_id}] User message saved to database (ID: {user_message.id})")
 
+    # Create placeholder assistant message
+    assistant_message = MessageModel(
+        conversation_id=conversation_id,
+        role="assistant",
+        content="",  # Will be populated by Celery task
+        reasoning=None
+    )
+    session.add(assistant_message)
+    session.commit()
+    session.refresh(assistant_message)
+    logger.info(f"[Conv {conversation_id}] Placeholder assistant message created (ID: {assistant_message.id})")
+
+    # Trigger Celery task
+    task = process_openai_stream.apply_async(
+        args=[assistant_message.id, message.content, conversation_id]
+    )
+    
+    logger.info(f"[Conv {conversation_id}] Celery task triggered: {task.id}")
+    logger.info(f"[Conv {conversation_id}] Client should stream from: /stream/{task.id}")
+    
+    return {
+        "task_id": task.id,
+        "message_id": assistant_message.id,
+        "status": "processing"
+    }
+
+
+@app.get("/stream/{task_id}")
+async def stream_response(
+    task_id: str,
+    session: Session = Depends(get_session)
+):
+    """
+    Stream the AI response from the database as chunks become available.
+    This endpoint polls the database and streams chunks to the client.
+    """
+    logger.info(f"[Stream {task_id}] Client connected for streaming")
+    
     async def generate_stream() -> AsyncGenerator[str, None]:
-        """Generate streaming response from OpenAI using Responses API"""
-        stream_start = datetime.now()
-        assistant_content = ""
-        assistant_reasoning = ""
-        chunk_count = 0
-
-        try:
-            logger.info(f"[Conv {conversation_id}] 🚀 Starting OpenAI stream request...")
-            logger.info(f"[Conv {conversation_id}] Current time: {stream_start.strftime('%H:%M:%S.%f')[:-3]}")
+        """Stream chunks from database as they become available"""
+        last_chunk_index = -1
+        done = False
+        max_wait_time = 300  # 5 minutes timeout
+        start_time = datetime.now()
+        
+        while not done:
+            # Check timeout
+            elapsed = (datetime.now() - start_time).total_seconds()
+            if elapsed > max_wait_time:
+                logger.warning(f"[Stream {task_id}] Timeout reached after {elapsed:.1f}s")
+                yield f"data: {json.dumps({'error': 'Stream timeout'})}\n\n"
+                break
             
-            # Create streaming response from OpenAI using Responses API
-            stream = await openai_client.responses.create(
-                model="gpt-5",
-                input=message.content,
-                reasoning={"effort": "high", "summary": "auto"},
-                stream=True
-            )
+            # Fetch new chunks
+            statement = select(StreamChunk).where(
+                StreamChunk.task_id == task_id,
+                StreamChunk.chunk_index > last_chunk_index
+            ).order_by(StreamChunk.chunk_index)
             
-            first_chunk_time = None
-            logger.info(f"[Conv {conversation_id}] ✓ Stream connection established, waiting for first chunk...")
-
-            # Handle each streamed event as it arrives
-            async for event in stream:
-                if not hasattr(event, "type"):
-                    continue  # Skip malformed events
-
-                # Handle response text deltas
-                if event.type == "response.output_text.delta":
-                    delta = getattr(event, "delta", "")
-                    if delta:
-                        if first_chunk_time is None:
-                            first_chunk_time = datetime.now()
-                            ttfb = (first_chunk_time - stream_start).total_seconds()
-                            logger.info(f"[Conv {conversation_id}] 📦 First chunk received! TTFB: {ttfb:.3f}s")
-                        
-                        chunk_count += 1
-                        assistant_content += delta
-                        
-                        # Log every 10th chunk to show progress without overwhelming logs
-                        if chunk_count % 10 == 0:
-                            elapsed = (datetime.now() - stream_start).total_seconds()
-                            logger.info(f"[Conv {conversation_id}] Streaming... chunks: {chunk_count}, "
-                                      f"chars: {len(assistant_content)}, elapsed: {elapsed:.2f}s")
-                        
-                        yield f"data: {json.dumps({'content': delta})}\n\n"
-
-                # Handle reasoning progress if available
-                elif event.type == "response.reasoning_summary_text.delta":
-                    reasoning_delta = getattr(event, "delta", "")
-                    if reasoning_delta:
-                        assistant_reasoning += reasoning_delta
-                        logger.info(f"[Conv {conversation_id}] 🧠 Reasoning chunk received")
-                        yield f"data: {json.dumps({'reasoning': reasoning_delta})}\n\n"
-
-                else:
-                    logger.warning(f"[Conv {conversation_id}] Unknown event type: {event.type}, full event: {event}")
-
-            # Save assistant message to database
-            assistant_message = MessageModel(
-                conversation_id=conversation_id,
-                role="assistant",
-                content=assistant_content,
-                reasoning=assistant_reasoning if assistant_reasoning else None
-            )
-            session.add(assistant_message)
-            session.commit()
-            logger.info(f"[Conv {conversation_id}] Assistant message saved to database")
-
-            # Final done signal
-            stream_end = datetime.now()
-            total_time = (stream_end - stream_start).total_seconds()
-            request_time = (stream_end - request_start).total_seconds()
+            chunks = session.exec(statement).all()
             
-            logger.info(f"")
-            logger.info(f"[Conv {conversation_id}] ✅ Stream completed!")
-            logger.info(f"[Conv {conversation_id}] Statistics:")
-            logger.info(f"[Conv {conversation_id}]   - Total chunks: {chunk_count}")
-            logger.info(f"[Conv {conversation_id}]   - Total characters: {len(assistant_content)}")
-            logger.info(f"[Conv {conversation_id}]   - Reasoning characters: {len(assistant_reasoning)}")
-            logger.info(f"[Conv {conversation_id}]   - Stream time: {total_time:.3f}s")
-            logger.info(f"[Conv {conversation_id}]   - Total request time: {request_time:.3f}s")
-            logger.info(f"[Conv {conversation_id}]   - End time: {stream_end.strftime('%H:%M:%S.%f')[:-3]}")
-            logger.info(f"{'='*80}")
-            logger.info(f"")
-            
-            yield f"data: {json.dumps({'done': True})}\n\n"
-
-        except Exception as e:
-            error_time = datetime.now()
-            logger.error(f"")
-            logger.error(f"[Conv {conversation_id}] ❌ ERROR occurred!")
-            logger.error(f"[Conv {conversation_id}] Error: {str(e)}")
-            logger.error(f"[Conv {conversation_id}] Time: {error_time.strftime('%H:%M:%S.%f')[:-3]}")
-            logger.error(f"[Conv {conversation_id}] Chunks before error: {chunk_count}")
-            logger.error(f"{'='*80}")
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-
-    logger.info(f"[Conv {conversation_id}] Returning StreamingResponse...")
+            if chunks:
+                for chunk in chunks:
+                    last_chunk_index = chunk.chunk_index
+                    
+                    if chunk.chunk_type == "content":
+                        yield f"data: {json.dumps({'content': chunk.content})}\n\n"
+                    elif chunk.chunk_type == "reasoning":
+                        yield f"data: {json.dumps({'reasoning': chunk.content})}\n\n"
+                    elif chunk.chunk_type == "done":
+                        logger.info(f"[Stream {task_id}] Stream completed")
+                        yield f"data: {json.dumps({'done': True})}\n\n"
+                        done = True
+                        break
+                    elif chunk.chunk_type == "error":
+                        logger.error(f"[Stream {task_id}] Error: {chunk.content}")
+                        yield f"data: {json.dumps({'error': chunk.content})}\n\n"
+                        done = True
+                        break
+            else:
+                # No new chunks, wait a bit before polling again
+                await asyncio.sleep(0.1)  # 100ms polling interval
+        
+        logger.info(f"[Stream {task_id}] Stream ended")
+    
     return StreamingResponse(
         generate_stream(),
         media_type="text/event-stream",
